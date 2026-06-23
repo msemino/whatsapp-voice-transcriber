@@ -15,7 +15,7 @@ param(
     [string]$Model       = "ggml-large-v3.bin",
     [string]$NucUser     = "YOUR_NUC_USER",
     [string]$NucHost     = "YOUR_NUC_HOST",   # e.g. 100.x.x.x (Tailscale) or nuc
-    [string]$NucInboxDir = "~/recordatorio-fichada/audio-inbox",
+    [string]$NucInboxDir = "~/wa-voice-inbox/audio-inbox",
     [string]$SelfNumber  = "YOUR_PHONE_NUMBER", # digits only, e.g. 5491199998888
     [string]$Language    = "es"
 )
