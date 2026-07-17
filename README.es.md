@@ -35,7 +35,7 @@ Este sistema resuelve todo con un pipeline que corre en hardware propio, nunca m
     ↓
 NUC (24/7) — captura y encola en audio-inbox/
     ↓ (scp vía Tailscale)
-PC RTX 3090 — Task Scheduler cada 4 min
+PC 24 GB GPU — Task Scheduler cada 4 min
     ↓
 whisper.cpp large-v3 (GPU, ~3-8s/min audio)
     ↓ (ssh: wa send --b64)

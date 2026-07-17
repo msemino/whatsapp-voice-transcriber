@@ -37,7 +37,7 @@ graph TB
         WA -->|"voice note detected\n(incoming or self)"| INBOX
     end
 
-    subgraph PC["💻 RTX 3090 PC (on-demand)"]
+    subgraph PC["💻 24 GB GPU PC (on-demand)"]
         SCHED["Windows Task Scheduler\nevery 4 minutes"]
         SCP["scp download\nqueue → local temp"]
         FFMPEG["ffmpeg\nogg → wav 16kHz"]
@@ -58,7 +58,7 @@ graph TB
 | Component | Always-on NUC | On-demand PC |
 |---|---|---|
 | **Role** | Owns the WhatsApp session, captures audio, routes messages | Runs GPU transcription, drains the queue |
-| **Why here** | WhatsApp requires a persistent session to receive messages | RTX 3090 is too power-hungry to run 24/7 just for transcription |
+| **Why here** | WhatsApp requires a persistent session to receive messages | 24 GB GPU is too power-hungry to run 24/7 just for transcription |
 | **Failure mode** | If PC is off, audio queues up and processes when PC wakes | If NUC is down, no new captures — but session survives reboots |
 
 **The queue acts as a buffer**: audio is never lost because the PC is asleep. When the PC wakes, the Task Scheduler fires within 4 minutes and drains everything accumulated.
@@ -225,7 +225,7 @@ powershell -ExecutionPolicy Bypass -File transcriber\transcribir-entrantes.ps1
 The transcription script uses CDP to send text via the NUC's WhatsApp daemon. It's a stateless batch job — run, drain, exit. A Task Scheduler job with "If task is already running, do not start a new instance" is simpler, more observable (event log), and avoids the complexity of a long-running service for something that takes <30 seconds per run.
 
 ### Why not transcribe on the NUC?
-The NUC has no GPU. whisper.cpp large-v3 on CPU takes ~15 minutes for a 1-minute voice note. The RTX 3090 does it in 3-8 seconds. Keeping transcription on the PC keeps the NUC lean and the latency acceptable.
+The NUC has no GPU. whisper.cpp large-v3 on CPU takes ~15 minutes for a 1-minute voice note. The 24 GB GPU does it in 3-8 seconds. Keeping transcription on the PC keeps the NUC lean and the latency acceptable.
 
 ### Why base64 over SSH?
 Passing UTF-8 text with accents, newlines, or special characters through SSH shell arguments is fragile — shells interpret many characters as metacharacters. Encoding the message as base64 before the SSH call and decoding it on the NUC side makes the transport fully safe regardless of content.
