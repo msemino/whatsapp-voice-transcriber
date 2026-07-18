@@ -1,67 +1,109 @@
 # WhatsApp Voice Transcriber
 
-> **Incoming WhatsApp voice note → local GPU transcription → text sent back to you. Zero cloud STT. 100% private.**
+> **Incoming WhatsApp voice note → local transcription → text sent back to you. Zero cloud STT.**
 
-A two-component pipeline that automatically transcribes every WhatsApp voice note you receive — and every voice memo you send to yourself — using a local [whisper.cpp](https://github.com/ggerganov/whisper.cpp) instance on your own GPU. The transcribed text is delivered back to you as a regular WhatsApp message.
+A two-component pipeline that transcribes every WhatsApp voice note you receive — and every voice memo you send to yourself — with a local speech-to-text engine. The text is delivered back as a regular WhatsApp message. Audio never leaves the network.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform: Linux + Windows](https://img.shields.io/badge/Platform-Linux%20%2B%20Windows-blue.svg)]()
-[![GPU: CUDA](https://img.shields.io/badge/GPU-CUDA%2012-76B900.svg)]()
-[![Model: whisper large-v3](https://img.shields.io/badge/Model-whisper%20large--v3-orange.svg)]()
+[![Engine: faster-whisper int8](https://img.shields.io/badge/Engine-faster--whisper%20int8-76B900.svg)]()
+[![Runs on: CPU](https://img.shields.io/badge/Runs%20on-CPU%20AVX--512%20VNNI-orange.svg)]()
+
+It started as a personal tool on a home GPU. It now runs as a **shared transcription engine** several engineers use daily, with other services calling the same capability.
 
 ---
 
-## Why I built this
+## The interesting part: the cost was fixed, not proportional
 
-Voice notes are the dominant communication format in WhatsApp (especially in Latin America). The problems with the standard experience:
+The original version ran `whisper.cpp` on a 24 GB GPU and worked fine. Then the numbers stopped making sense — measured with the model **already resident in RAM**, so this is not load time:
 
-- **Voice notes are annoying to listen to** in meetings, quiet spaces, or when you're in a hurry.
-- **Cloud STT services** (Google, Azure, AWS) receive your audio — including conversations you may want to keep private.
-- **WhatsApp's built-in transcription** is mediocre and only available in some regions.
-- **Self-forwarded voice memos** (thinking out loud → send to yourself) have no transcription at all.
+| Voice note | Wall clock |
+|---|---|
+| 2 s | 33 s |
+| 3 s | 33 s |
+| 6 s | 36 s |
+| 37 s | 74 s |
 
-This system solves all of it with a pipeline that runs on hardware you already own, never sends audio to external servers, and operates 24/7 even when your PC is asleep.
+**A 3-second note cost the same as a 30-second one.** `whisper.cpp` pads every clip to a **fixed 30-second window**, so a short note runs the full encoder over mostly silence. Almost every voice note is short — so almost every note was paying for silence.
+
+That reframes the problem: the bottleneck was never the hardware, and a faster GPU would have bought nothing. Two changes fixed it.
+
+1. **Voice-activity detection** — silence is dropped before the model sees it.
+2. **CTranslate2 int8 kernels** — which use the **AVX-512 VNNI** instructions already present in the CPU. `whisper.cpp` does not exploit that path; CTranslate2 is built for it.
+
+Same audio, same machine, N=3 per side, warm-up discarded:
+
+| Audio | Before | After | Engine-level |
+|---|---|---|---|
+| 10.5 s | 34.3 s | 4.8 s | **7.1x** |
+| 37 s | 74 s | 10.8 s | **6.9x** |
+| 6 min | 585 s | 96.7 s | **6.0x** |
+
+**End to end the win is 3.2x** — 34 s to about 10 s of wall clock per note — because the deployed design reloads the model per audio instead of keeping a resident daemon. Both numbers are quoted because they are not the same number: 6-7x is engine against engine; 3.2x is what you actually wait for.
+
+**The GPU left the design entirely.** Same throughput class, no accelerator to schedule, wake or reserve.
+
+### Where the model of the cost broke
+
+Modelling cost as `windows x constant` predicted the 37-second note well — 2 windows, ~68 s predicted against 74 s measured — and **failed on the 6-minute note**: ~465 s predicted, 585 s measured, twice, identically. The missing term is the **decoder**, which scales with tokens produced: dense continuous speech loads it on every window while a short note barely touches it. The window model is right in direction and understates on long, dense audio.
+
+It is written down because a prediction that cannot fail proves nothing.
+
+### Quality
+
+Validated against a planted-terminology recording (acronyms, IP addresses, proper nouns, numbers) rather than against another model's output — a stronger model is still just another opinion, and the two can be wrong in the same place. On 12 decidable terms the int8 turbo engine scored **11/12, matching the full-precision model it replaced**, differing only on one rare word. One acronym was missed by *every* engine tested, which makes it a limit of the recognizer, not of this change.
+
+Not validated on long, noisy, multi-speaker audio. That is a real limit, stated rather than glossed.
 
 ---
 
 ## Architecture
 
-The system has two physical components connected over a private network (Tailscale):
+Two components on a private network (Tailscale). The shape never changed — only the engine in the second one did.
 
 ```mermaid
 graph TB
-    subgraph NUC["🖥️ NUC — mini-PC (24/7, always on)"]
-        WA["WhatsApp daemon\nwhatsapp-web.js\n(multi-account)"]
-        INBOX["audio-inbox/\nqueue directory\n.ogg + .json per note"]
-        WA_SEND["wa CLI\n(send text back)"]
-        WA -->|"voice note detected\n(incoming or self)"| INBOX
+    subgraph CAP["Capture node - always on"]
+        WA["WhatsApp daemon<br/>whatsapp-web.js<br/>multi-account"]
+        INBOX["audio-inbox/<br/>queue directory<br/>.ogg + .json per note"]
+        WA_SEND["wa CLI<br/>sends the text back"]
+        WA -->|"voice note detected<br/>incoming or self"| INBOX
     end
 
-    subgraph PC["💻 24 GB GPU PC (on-demand)"]
-        SCHED["Windows Task Scheduler\nevery 4 minutes"]
-        SCP["scp download\nqueue → local temp"]
-        FFMPEG["ffmpeg\nogg → wav 16kHz"]
-        WHISPER["whisper.cpp\nlarge-v3 GPU\n~3-8s/min audio"]
-        SCHED --> SCP --> FFMPEG --> WHISPER
+    subgraph TR["Transcription node - CPU only, always on"]
+        POLL["worker loop<br/>polls every few seconds"]
+        FFMPEG["ffmpeg<br/>ogg to wav 16 kHz"]
+        VAD["VAD<br/>drop the silence"]
+        ENGINE["faster-whisper<br/>large-v3-turbo int8<br/>AVX-512 VNNI"]
+        POLL --> FFMPEG --> VAD --> ENGINE
     end
 
-    INBOX -. "scp over Tailscale" .-> SCP
-    WHISPER -->|"text via\nwa send --b64 over SSH"| WA_SEND
-    WA_SEND -->|"WhatsApp message\nto self-chat"| YOU([📱 Your phone])
-
-    style NUC fill:#1a1a2e,color:#e0e0ff
-    style PC fill:#1a2e1a,color:#e0ffe0
+    INBOX -. "pulled over the tailnet" .-> POLL
+    ENGINE -->|"text via wa send --b64 over SSH"| WA_SEND
+    WA_SEND -->|"WhatsApp message to self-chat"| YOU([Your phone])
 ```
 
-### Why two nodes?
+### Why two nodes
 
-| Component | Always-on NUC | On-demand PC |
+| | Capture node | Transcription node |
 |---|---|---|
-| **Role** | Owns the WhatsApp session, captures audio, routes messages | Runs GPU transcription, drains the queue |
-| **Why here** | WhatsApp requires a persistent session to receive messages | 24 GB GPU is too power-hungry to run 24/7 just for transcription |
-| **Failure mode** | If PC is off, audio queues up and processes when PC wakes | If NUC is down, no new captures — but session survives reboots |
+| **Role** | Owns the WhatsApp session, captures audio, sends the text back | Drains the queue and transcribes |
+| **Why separate** | WhatsApp needs a persistent session to receive messages, so it lives wherever that daemon runs and survives reboots | The engine is shared — other services call the same capability instead of duplicating it per consumer |
+| **Failure mode** | If the transcriber is down, audio queues and drains later | If the capture node is down, no new captures; the session survives reboots |
 
-**The queue acts as a buffer**: audio is never lost because the PC is asleep. When the PC wakes, the Task Scheduler fires within 4 minutes and drains everything accumulated.
+The original design **needed** the queue as a buffer, because the GPU machine slept and woke on a timer every 4 minutes. That reason is gone: both nodes are always on and the worker polls every few seconds, so a 10-second note comes back in about 10 seconds. The queue stayed because it still decouples the two halves.
+
+---
+
+## Failure handling
+
+The engine is the part most likely to fail, so it is the part with the least authority:
+
+- **Engine unavailable** → falls back to the original `whisper-cli` binary. Slower (~34 s), nothing lost.
+- **Hard failure** — non-zero exit from ffmpeg or the model → the source file is **kept**, a retry counter is persisted, and after N attempts it moves to `failed/`. A failure is never reported as "silence".
+- **Delivery not confirmed** → the source file is not deleted. Files are removed only after the message is confirmed sent, so nothing is lost or processed twice.
+
+An empty transcript is a valid answer — the note really was silence — and is distinguished from an error by the exit code, not by the emptiness of the output.
 
 ---
 
@@ -69,75 +111,45 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Phone as 📱 Sender's phone
-    participant WA as WhatsApp daemon (NUC)
-    participant Inbox as audio-inbox/ (NUC)
-    participant PC as Transcriber (PC)
-    participant Self as 📱 Your self-chat
+    participant Phone as Sender phone
+    participant WA as WhatsApp daemon
+    participant Inbox as audio-inbox/
+    participant TR as Transcription node
+    participant Self as Your self-chat
 
     Phone->>WA: voice note (ptt / audio)
     WA->>WA: downloadMedia()
-    WA->>Inbox: write <id>.ogg + <id>.json
-    Note over Inbox: waits (PC may be off)
-    PC->>Inbox: scp download (every 4 min)
-    PC->>PC: ffmpeg → wav 16kHz
-    PC->>PC: whisper.cpp large-v3 (GPU)
-    PC->>WA: ssh: wa send --b64 <text> -a personal
-    WA->>Self: WhatsApp message\n"Audio [account] HH:mm\nFrom: Name (+num)\n<transcription>"
-    PC->>Inbox: ssh: rm <id>.ogg <id>.json
+    WA->>Inbox: write id.ogg + id.json
+    TR->>Inbox: poll every few seconds
+    TR->>TR: ffmpeg to wav 16 kHz
+    TR->>TR: VAD, then faster-whisper int8
+    TR->>WA: ssh wa send --b64 text
+    WA->>Self: WhatsApp message with the transcript
+    TR->>Inbox: rm id.ogg id.json, only after delivery
 ```
 
 ---
 
 ## The self-forward use case
 
-You can send a voice note **to yourself** — recording a thought on the go — and receive the transcription in your self-chat automatically. This is particularly useful for:
-
-- Voice memos while driving
-- Rapid idea capture without typing
-- Feeding long-form spoken content to an LLM that doesn't accept audio
-
-```mermaid
-sequenceDiagram
-    participant You as 📱 You
-    participant WA as WhatsApp daemon (NUC)
-    participant PC as Transcriber (PC)
-    participant Self as 📱 Your self-chat
-
-    You->>WA: forward voice note to yourself
-    Note over WA: message_create event (fromMe=true)
-    WA->>WA: getContactById(msg.to).isMe → true
-    WA->>WA: enqueue(msg, "self")
-    PC->>PC: transcribe (same pipeline)
-    PC->>Self: "Self-forwarded\n<transcription>"
-```
+Send a voice note **to yourself** — a thought on the go — and get the transcription in your self-chat. Useful for memos while driving, capturing ideas without typing, or feeding long spoken content to a model that does not accept audio.
 
 ### Engineering note: the `@lid` trap
 
-Detecting a self-forwarded message by comparing `message.from === message.to` does **not work** in WhatsApp Web. WhatsApp serialises `from` as `<number>@c.us` and `to` as `<account-linked-id>@lid` — a newer identifier format — so the two strings will never be equal even for the same person. The correct approach is to call `getContactById(message.to)` and check the `.isMe` property on the returned Contact object.
+Detecting a self-forwarded message by comparing `message.from === message.to` does **not work** in WhatsApp Web. WhatsApp serialises `from` as `<number>@c.us` and `to` as `<account-linked-id>@lid` — a newer identifier format — so the two strings never match, even for the same person. Call `getContactById(message.to)` and check `.isMe` on the returned Contact.
 
 ```js
-// Wrong — these will never match
-if (msg.from === msg.to) { ... }
+// Wrong - these will never match
+if (msg.from === msg.to) { /* never fires */ }
 
-// Correct
+// Right
 const dest = await client.getContactById(msg.to);
 if (dest && dest.isMe) { enqueue(msg, "self"); }
 ```
 
----
+### Why base64 over SSH
 
-## Features
-
-| Feature | Detail |
-|---|---|
-| **100% local STT** | whisper.cpp large-v3 on your GPU — no audio leaves your machine |
-| **Multi-account** | Captures from all your WhatsApp accounts simultaneously |
-| **Self-forward support** | Voice memos you send to yourself are also transcribed |
-| **Async queue** | PC can be off; audio accumulates and processes when it wakes |
-| **Labelled output** | Transcription includes: account, time, sender name, group name |
-| **Base64 transport** | Text sent over SSH as base64 — accents/newlines survive correctly |
-| **Clean dequeue** | Files deleted from NUC only after successful delivery to self-chat |
+Passing UTF-8 text with accents, newlines or special characters through SSH shell arguments is fragile — shells interpret many characters as metacharacters. Encoding the message as base64 before the SSH call and decoding it on the other side makes the transport safe regardless of content.
 
 ---
 
@@ -151,35 +163,36 @@ De: María García (+5491155551234) en Grupo Familia
 Che, no te olvides de traer el documento para la reunión del jueves...
 ```
 
-For self-forwarded notes:
-```
-Audio entrante [personal] 09:15
-De: Self-forwarded
-Tengo que acordarme de revisar el presupuesto de la obra antes de hablar con el contratista...
-```
+---
+
+## What is in this repository
+
+| Path | What it is |
+|---|---|
+| `daemon/audio-capture.js` | WhatsApp daemon: session, multi-account capture, self-forward detection, queue writing |
+| `transcriber/transcribe-fw.py` | **Current engine.** faster-whisper int8 on CPU with VAD. Prints the transcript to stdout and nothing else |
+| `transcriber/transcribir-entrantes.ps1` | **Original GPU implementation** — whisper.cpp + CUDA on Windows. Kept deliberately: it is where the project started and it is the baseline the measurements above are compared against |
+| `transcriber/setup-task.ps1` | Scheduled-task installer for the original Windows version |
+
+The orchestration around the engine — retry counters, locks, delivery confirmation — is deployment-specific and not published here. What is published is the portable part: the engine call and the capture daemon.
 
 ---
 
 ## Requirements
 
-**NUC / mini-PC (always-on, Linux)**
-- Node.js 20+
-- [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) 1.34+
-- Google Chrome (headless)
-- `wa` CLI (wrapper script over the daemon's HTTP API via localhost Bearer token)
+**Capture node** — Node.js 20+, [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) 1.34+, headless Chrome, a `wa` CLI wrapper over the daemon's local HTTP API.
 
-**PC (GPU, Windows)**
-- NVIDIA GPU with CUDA 12
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) compiled with CUDA
-- Model `ggml-large-v3.bin` (~3 GB, download from [HuggingFace](https://huggingface.co/ggerganov/whisper.cpp))
-- ffmpeg (`winget install Gyan.FFmpeg`)
-- SSH key access to NUC (for SCP and `wa` CLI)
+**Transcription node** — Python 3, `faster-whisper`, `ffmpeg`. A CPU with AVX-512 VNNI gives the int8 speed-up described above; without it the engine still runs, just slower.
 
----
+```bash
+python3 -m venv venv
+venv/bin/pip install faster-whisper
+venv/bin/python transcriber/transcribe-fw.py note.ogg
+```
 
-## Setup
+The first run downloads the model to the local cache; after that it runs offline.
 
-### 1. NUC — integrate audio capture into your daemon
+### Setup — capture side
 
 ```js
 const { attachAudioCapture } = require("./audio-capture");
@@ -192,75 +205,23 @@ attachAudioCapture(client, {
 });
 ```
 
-### 2. PC — deploy the transcription script
-
-```powershell
-# Clone and install
-git clone https://github.com/msemino/whatsapp-voice-transcriber
-cd whatsapp-voice-transcriber
-
-# Edit transcriber/transcribir-entrantes.ps1 — set NucHost, NucUser, SelfNumber
-
-# Register the Task Scheduler job (run as Administrator)
-powershell -ExecutionPolicy Bypass -File transcriber\setup-task.ps1
-```
-
-### 3. Verify
-
-1. Send yourself a voice note on WhatsApp.
-2. Wait up to 4 minutes.
-3. Check your self-chat — the transcription should appear.
-
-Or trigger immediately:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File transcriber\transcribir-entrantes.ps1
-```
-
----
-
-## Engineering notes
-
-### Why Task Scheduler instead of a Windows service?
-The transcription script uses CDP to send text via the NUC's WhatsApp daemon. It's a stateless batch job — run, drain, exit. A Task Scheduler job with "If task is already running, do not start a new instance" is simpler, more observable (event log), and avoids the complexity of a long-running service for something that takes <30 seconds per run.
-
-### Why not transcribe on the NUC?
-The NUC has no GPU. whisper.cpp large-v3 on CPU takes ~15 minutes for a 1-minute voice note. The 24 GB GPU does it in 3-8 seconds. Keeping transcription on the PC keeps the NUC lean and the latency acceptable.
-
-### Why base64 over SSH?
-Passing UTF-8 text with accents, newlines, or special characters through SSH shell arguments is fragile — shells interpret many characters as metacharacters. Encoding the message as base64 before the SSH call and decoding it on the NUC side makes the transport fully safe regardless of content.
-
-```powershell
-# Send side (PC)
-$b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($fullMsg))
-ssh nuc "wa send $SelfNumber --b64 $b64 -a personal"
-
-# Receive side (NUC wa CLI) — decodes before calling the daemon API
-```
-
 ---
 
 ## Privacy model
 
 | Data | Where it goes |
 |---|---|
-| Audio content | Never leaves your LAN/VPN — downloaded from NUC to PC via SCP |
-| Transcription text | Sent from PC → NUC via SSH, then NUC → WhatsApp as a regular message |
-| Sender metadata | Stays local (name, number in the queue JSON); only included in the text you receive |
-| WhatsApp session | Lives on the NUC; WhatsApp servers see a normal multi-device session |
+| Audio content | Never leaves the private network |
+| Transcription text | Sent back to the capture node over SSH, then delivered as a normal WhatsApp message |
+| Sender metadata | Stays local; only included in the text you receive |
+| WhatsApp session | Lives on the capture node; WhatsApp servers see a normal multi-device session |
 
-The only data that leaves your network is the final text message through WhatsApp — the same as if you had typed it yourself.
-
----
-
-## Related projects
-
-- **[local-voice-recorder](https://github.com/msemino/local-voice-recorder)** — same whisper.cpp stack; press a button to record, get text in your clipboard.
-- **[self-hosted-ai-lab](https://github.com/msemino/self-hosted-ai-lab)** — the 2-node system this pipeline is part of.
-- **[local-agent-orchestrator](https://github.com/msemino/local-agent-orchestrator)** — AI orchestrator on the NUC that processes transcribed content.
+The only data that leaves the network is the final text message through WhatsApp — the same as if you had typed it yourself.
 
 ---
 
 ## License
 
-MIT © Marcelo Semino
+MIT — see [LICENSE](LICENSE).
+
+📖 [Documentación en español](README.es.md)
