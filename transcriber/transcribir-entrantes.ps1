@@ -1,7 +1,7 @@
 # transcribir-entrantes.ps1 — Dequeue WhatsApp voice notes, transcribe locally, send text back.
 #
 # Architecture:
-#   NUC (24/7 daemon)  --(audio-inbox/ queue)--> THIS SCRIPT on RTX 3090 PC
+#   NUC (24/7 daemon)  --(audio-inbox/ queue)--> THIS SCRIPT on the GPU PC
 #   THIS SCRIPT        --(wa send --b64)-------> self-chat on WhatsApp
 #
 # Triggered by Windows Task Scheduler every 4 minutes.

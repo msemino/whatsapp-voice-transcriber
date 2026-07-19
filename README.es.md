@@ -102,6 +102,78 @@ Una transcripción vacía es una respuesta válida —la nota era realmente sile
 
 ---
 
+## Cuando la dependencia se rompe abajo: `"r"`
+
+Las notas de voz dejaron de descargarse. El texto seguía funcionando. El único rastro en el log era este:
+
+```
+[ERROR] [LISTENER] listener audio: r
+```
+
+`whatsapp-web.js` hace ingeniería inversa de WhatsApp Web, así que se rompe cuando WhatsApp cambia algo. Ese es el costo del enfoque, y lo interesante no es que se haya roto: es que **estuvo roto un día entero con todos los monitores en verde**, y que el error era ilegible.
+
+### Por qué el error no decía nada
+
+`e.message` valía `"r"`. Al pedirle el stack, `e.stack` valía `"r: r"` — cero frames.
+
+La excepción se lanza **dentro del contexto de página**. Puppeteer la serializa para cruzar la frontera y sobreviven solo `name` y `message`; en el bundle minificado de WhatsApp los dos son la letra `r`. No había nada que extraerle al objeto de error.
+
+**La salida fue dejar de interrogar el error e instrumentar el camino donde ocurre** — tres sondas inyectadas en la página, cada una con una pregunta:
+
+| Sonda | Pregunta | Respuesta | Qué descartó |
+|---|---|---|---|
+| 1 | ¿Qué propiedades propias trae el error? | `DataError` de IndexedDB | La descarga y el descifrado |
+| 2 | ¿Qué paso lanza la excepción? | La búsqueda del mensaje | El download manager |
+| 3 | ¿Cómo es el id realmente? | `$1`, no `_serialized` | — |
+
+> **La pista decisiva fue una ausencia.** La sonda 2 armaba su resultado como `{ msgId: msgId, ... }` y el JSON impreso **no tenía el campo `msgId`**. `JSON.stringify` descarta las claves cuyo valor es `undefined`. Ese hueco *era* el bug: `undefined` estaba llegando a IndexedDB, que respondía, con toda precisión, que no se había especificado ninguna clave.
+
+### Causa raíz
+
+WhatsApp dejó de exponer `_serialized` en las claves de mensaje. El campo equivalente ahora es `$1`:
+
+```
+keys: ["fromMe", "remote", "id", "$1"]
+$1:   "false_<id-de-contacto>@lid_<HEX>"
+```
+
+La librería sigue leyendo `this.id._serialized` dentro de `downloadMedia()`, obtiene `undefined` y se lo pasa a `Msg.getMessagesById([undefined])`. **No había a qué actualizar**: la versión instalada ya era la última publicada. El texto no se vio afectado porque su camino nunca serializa un id de mensaje.
+
+### La hipótesis que estaba equivocada
+
+Al ver `@lid` dentro del id, la primera hipótesis fue la migración de WhatsApp a direcciones LID — plausible y consistente con la cronología. **Era incorrecta.** Los envíos *a* direcciones `@lid` funcionaban antes, durante y después del corte. El LID aparece dentro del id pero es circunstancial; lo que cambió fue *el nombre del campo*, no el esquema de direccionamiento.
+
+Queda registrado porque la hipótesis equivocada era la atractiva: el `@lid` ya había dado problemas en este código, y eso lo hacía sospechoso **por disponibilidad, no por evidencia**.
+
+### Dos decisiones en el arreglo
+
+**No parchear `node_modules`.** Una línea sobre la librería habría funcionado. Se descartó porque `npm install` la borra en silencio, y la falla resultante se vería exactamente como esta —audio muerto, sin error utilizable— salvo que la causa ya no estaría a la vista.
+
+**No depender de `$1`.** Es un símbolo generado por el minificador y puede ser `$2` en el próximo build. `serialiseMsgKey()` degrada en tres escalones —`_serialized` → `$1` → **reconstrucción desde los campos estables `fromMe`/`remote`/`id`**— y la reconstrucción produce el string idéntico.
+
+### El canario, y la primera versión que se tiró a la basura
+
+Ahora corre un chequeo cada pocos días contra el camino de media.
+
+**La primera versión pasaba en las dos cuentas y se borró antes de desplegarla.** Agarraba el modelo del mensaje directo de la colección y bajaba la media **sin serializar nunca un id** — o sea que habría reportado verde durante toda la caída. Probaba algo *contiguo* a la falla.
+
+La versión desplegada recorre el camino de producción: serializar el id → **buscar el mensaje por ese id** → recién ahí descargar. El paso 2 es el que estallaba.
+
+Dos reglas en su contrato de resultado:
+
+- **"Sin material" no es verde.** Si no hay nota de voz contra la cual probar, reporta que *no pudo correr*. Un canario mudo es indistinguible de uno sano — que es, otra vez, el bug original.
+- **Reporta por qué puerta entró** (`via`). Verde vía `rebuilt` significa que el campo se renombró de nuevo y el fallback está sosteniendo el sistema — conviene saberlo antes de que falle del todo.
+
+Está probado en **los dos** sentidos. Un canario que nunca se vio en rojo no es un canario probado.
+
+### Un bug más, encontrado al salir
+
+La misma causa raíz había roto en silencio la confirmación de entrega. La espera del acknowledgement comparaba `enviado.id._serialized === evento.id._serialized` — con **ambos lados `undefined`**. Como `undefined === undefined` es `true`, la espera se resolvía con el acknowledgement de *cualquier* mensaje. No venía confirmando la entrega de nada.
+
+El arreglo además se niega a adivinar: si no puede serializar el id, no engancha listener y la espera cae a su timeout, porque un comparador que matchea todo es peor que no tener confirmación.
+
+---
+
 ## El caso del self-forward
 
 Te mandás una nota de voz **a vos mismo** —una idea al vuelo— y recibís la transcripción en tu self-chat. Sirve para memos manejando, capturar ideas sin tipear, o darle contenido hablado largo a un modelo que no acepta audio.
@@ -125,7 +197,8 @@ if (dest && dest.isMe) { enqueue(msg, "self"); }
 
 | Ruta | Qué es |
 |---|---|
-| `daemon/audio-capture.js` | Daemon de WhatsApp: sesión, captura multi-cuenta, detección de self-forward, escritura en la cola |
+| `daemon/audio-capture.js` | Daemon de WhatsApp: sesión, captura multi-cuenta, detección de self-forward, escritura en la cola, serialización de id tolerante al minificador y descarga de media propia |
+| `daemon/media-selftest.js` | Canario activo del camino de media — serializa un id, busca el mensaje **por ese id** y recién ahí descarga. El paso que se rompió |
 | `transcriber/transcribe-fw.py` | **Motor actual.** faster-whisper int8 en CPU con VAD. Imprime la transcripción en stdout y nada más |
 | `transcriber/transcribir-entrantes.ps1` | **Implementación original en GPU** — whisper.cpp + CUDA en Windows. Se conserva a propósito: es donde nació el proyecto y es la línea base contra la que se comparan las mediciones de arriba |
 | `transcriber/setup-task.ps1` | Instalador de la tarea programada de la versión Windows original |

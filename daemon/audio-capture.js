@@ -16,6 +16,89 @@ const fs   = require("fs");
 const path = require("path");
 
 /**
+ * Serialise a WhatsApp MsgKey, tolerating minifier renames.
+ *
+ * WhatsApp Web stopped exposing `_serialized` on message keys. The equivalent
+ * field is now called `$1` — a name produced by the minifier, which means it
+ * can become `$2` in any future build. So `$1` is only a shortcut here: the
+ * last resort rebuilds the same string from the three stable fields.
+ *
+ *   { fromMe: false, remote: "<id>@lid", id: "<HEX>", $1: "false_<id>@lid_<HEX>" }
+ *
+ * Depending on `_serialized` alone is what silently broke media downloads:
+ * the library kept reading the old name, got `undefined`, and handed that to
+ * IndexedDB, which answered "No key or key range specified".
+ */
+function serialiseMsgKey(key) {
+  if (!key) return "";
+  if (typeof key === "string") return key;
+  if (key._serialized) return key._serialized;
+  if (key.$1) return key.$1;
+  const remote = key.remote && key.remote._serialized ? key.remote._serialized : key.remote;
+  if (remote && key.id) return String(!!key.fromMe) + "_" + remote + "_" + key.id;
+  return "";
+}
+
+/**
+ * Download media for a message without going through Message.downloadMedia().
+ *
+ * The library's own implementation reads `this.id._serialized` internally, so
+ * fixing the ID on our side is not enough — the broken read happens inside it.
+ * This mirrors its logic but passes an ID produced by serialiseMsgKey().
+ *
+ * Patching node_modules would have been a one-line fix and was rejected: an
+ * `npm install` erases it silently, and the resulting failure looks exactly
+ * like this one — dead audio, no usable error.
+ */
+async function downloadMedia(client, message) {
+  const msgId = serialiseMsgKey(message.id);
+  if (!msgId) throw new Error("could not serialise message id");
+
+  const result = await client.pupPage.evaluate(async (id) => {
+    const collections = window.require("WAWebCollections");
+    let msg = collections.Msg.get(id);
+    if (!msg) {
+      const found = await collections.Msg.getMessagesById([id]);
+      msg = found && found.messages && found.messages[0];
+    }
+    if (!msg || !msg.mediaData) return { error: "message has no mediaData" };
+    if (msg.mediaData.mediaStage === "REUPLOADING") return { error: "media expired" };
+
+    if (msg.mediaData.mediaStage !== "RESOLVED") {
+      try {
+        await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+      } catch (e) {
+        return { error: "resolve failed: " + String(e && e.message).slice(0, 150) };
+      }
+    }
+    const stage = msg.mediaData.mediaStage || "";
+    if (stage.includes("ERROR") || stage === "FETCHING") return { error: "mediaStage=" + stage };
+
+    // The download manager expects a QPL tracer (Meta's internal profiler).
+    // A no-op stub satisfies it without pulling in the real one.
+    const qplStub = { addAnnotations() { return this; }, addPoint() { return this; } };
+    try {
+      const buffer = await window.require("WAWebDownloadManager").downloadManager.downloadAndMaybeDecrypt({
+        directPath: msg.directPath,
+        encFilehash: msg.encFilehash,
+        filehash: msg.filehash,
+        mediaKey: msg.mediaKey,
+        mediaKeyTimestamp: msg.mediaKeyTimestamp,
+        type: msg.type,
+        signal: new AbortController().signal,
+        downloadQpl: qplStub,
+      });
+      return { data: await window.WWebJS.arrayBufferToBase64Async(buffer), mimetype: msg.mimetype };
+    } catch (e) {
+      return { error: "download/decrypt: " + String(e && e.message ? e.message : e).slice(0, 200) };
+    }
+  }, msgId);
+
+  if (!result || result.error) throw new Error((result && result.error) || "no result");
+  return result;
+}
+
+/**
  * Attach audio capture listeners to a whatsapp-web.js Client.
  *
  * @param {import("whatsapp-web.js").Client} client
@@ -33,7 +116,7 @@ function attachAudioCapture(client, { label, inboxDir, log }) {
       // Only handle voice notes and audio messages
       if (message.type !== "ptt" && message.type !== "audio") return;
 
-      const media = await message.downloadMedia();
+      const media = await downloadMedia(client, message);
       if (!media || !media.data) return;
 
       // Build metadata: sender name, number, chat name
@@ -43,11 +126,11 @@ function attachAudioCapture(client, { label, inboxDir, log }) {
       try { chat    = await message.getChat();    } catch (_) {}
 
       // Sanitise the message ID so it's safe as a filename
-      const safeId = (label + "_" + message.id._serialized).replace(/[^a-zA-Z0-9_]/g, "_");
+      const safeId = (label + "_" + serialiseMsgKey(message.id)).replace(/[^a-zA-Z0-9_]/g, "_");
 
       const meta = {
         acc:        label,
-        msgId:      message.id._serialized,
+        msgId:      serialiseMsgKey(message.id),
         origin,                                         // "incoming" | "self"
         timestamp:  new Date(message.timestamp * 1000).toISOString(),
         fromName:   origin === "self"
@@ -101,4 +184,4 @@ function attachAudioCapture(client, { label, inboxDir, log }) {
   });
 }
 
-module.exports = { attachAudioCapture };
+module.exports = { attachAudioCapture, serialiseMsgKey, downloadMedia };

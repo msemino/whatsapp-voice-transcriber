@@ -107,6 +107,78 @@ An empty transcript is a valid answer — the note really was silence — and is
 
 ---
 
+## When the dependency broke underneath: `"r"`
+
+Every voice note stopped downloading. Text kept working. The only trace in the log was this:
+
+```
+[ERROR] [LISTENER] listener audio: r
+```
+
+`whatsapp-web.js` reverse-engineers WhatsApp Web, so it breaks when WhatsApp ships a change. This is the cost of the approach, and the interesting part is not that it broke — it is that **it stayed broken for a day while every monitor was green**, and that the error was unreadable.
+
+### Why the error said nothing
+
+`e.message` was `"r"`. Asking for `e.stack` returned `"r: r"` — no frames.
+
+The exception is thrown **inside the page context**. Puppeteer serialises it across the boundary and only `name` and `message` survive; in WhatsApp's minified bundle both are the letter `r`. There was nothing to extract from the error object.
+
+**The fix was to stop interrogating the error and instrument the path where it happens** — three probes injected into the page, each answering one question:
+
+| Probe | Question | Answer | Ruled out |
+|---|---|---|---|
+| 1 | What own properties does the error carry? | `DataError` from IndexedDB | The download and the decryption |
+| 2 | Which step throws? | The message lookup | The download manager |
+| 3 | What does the id actually look like? | `$1`, not `_serialized` | — |
+
+> **The decisive clue was an absence.** Probe 2 built its result as `{ msgId: msgId, ... }` and the printed JSON **had no `msgId` field at all**. `JSON.stringify` drops keys whose value is `undefined`. That hole *was* the bug — `undefined` was reaching IndexedDB, which replied, accurately, that no key had been specified.
+
+### Root cause
+
+WhatsApp stopped exposing `_serialized` on message keys. The equivalent field is now `$1`:
+
+```
+keys: ["fromMe", "remote", "id", "$1"]
+$1:   "false_<contact-id>@lid_<HEX>"
+```
+
+The library still reads `this.id._serialized` inside `downloadMedia()`, gets `undefined`, and passes it to `Msg.getMessagesById([undefined])`. **There was nothing to upgrade to** — the installed version was already the latest published. Text was unaffected because the text path never serialises a message id.
+
+### The hypothesis that was wrong
+
+Seeing `@lid` inside the id, the first hypothesis was WhatsApp's migration to LID addressing — plausible, and consistent with the timeline. **It was wrong.** Sends *to* `@lid` addresses were working before, during and after the outage. The LID appears inside the id but is incidental; what changed was the *name of the field*, not the addressing scheme.
+
+It is recorded because the wrong hypothesis was the attractive one: `@lid` had caused trouble in this codebase before, which made it suspicious by availability rather than by evidence.
+
+### Two decisions in the fix
+
+**Not patching `node_modules`.** A one-line edit to the library would have worked. It was rejected because `npm install` erases it silently, and the resulting failure would look exactly like this one — dead audio, no usable error — except the cause would no longer be visible.
+
+**Not depending on `$1`.** It is a minifier-generated symbol and can be `$2` in the next build. `serialiseMsgKey()` degrades through three steps — `_serialized` → `$1` → **rebuild from the stable `fromMe`/`remote`/`id` fields** — and the rebuild produces the identical string.
+
+### The canary, and the first version that was thrown away
+
+A check now runs every few days against the media path.
+
+**The first version passed on both accounts and was deleted before deployment.** It took the message model straight from the collection and downloaded the media **without ever serialising an id** — so it would have reported green throughout the entire outage. It tested something *adjacent* to the failure.
+
+The deployed version walks the production path: serialise the id → **look the message up by that id** → then download. Step 2 is the one that used to throw.
+
+Two rules in its result contract:
+
+- **"No material" is not green.** With no voice note to test against, it reports that it *could not run*. A silent canary is indistinguishable from a healthy one — which is the original bug, again.
+- **It reports which door it came through** (`via`). Green via `rebuilt` means the field was renamed again and the fallback is carrying the system — worth knowing before it fails outright.
+
+It is tested in **both** directions. A canary that has never been seen red is not a tested canary.
+
+### One more bug, found on the way out
+
+The same root cause had quietly broken delivery confirmation. The acknowledgement wait compared `sent.id._serialized === event.id._serialized` — with **both sides `undefined`**. Since `undefined === undefined` is `true`, the wait resolved on the acknowledgement of *any* message. It had not been confirming delivery of anything.
+
+The repair also refuses to guess: if the id cannot be serialised, no listener is attached and the wait falls through to its timeout, because a comparator that matches everything is worse than no confirmation at all.
+
+---
+
 ## Sequence: incoming voice note
 
 ```mermaid
@@ -169,7 +241,8 @@ Che, no te olvides de traer el documento para la reunión del jueves...
 
 | Path | What it is |
 |---|---|
-| `daemon/audio-capture.js` | WhatsApp daemon: session, multi-account capture, self-forward detection, queue writing |
+| `daemon/audio-capture.js` | WhatsApp daemon: session, multi-account capture, self-forward detection, queue writing, minifier-tolerant id serialisation and its own media download |
+| `daemon/media-selftest.js` | Active canary for the media path — serialises an id, looks the message up **by that id**, then downloads. The step that broke |
 | `transcriber/transcribe-fw.py` | **Current engine.** faster-whisper int8 on CPU with VAD. Prints the transcript to stdout and nothing else |
 | `transcriber/transcribir-entrantes.ps1` | **Original GPU implementation** — whisper.cpp + CUDA on Windows. Kept deliberately: it is where the project started and it is the baseline the measurements above are compared against |
 | `transcriber/setup-task.ps1` | Scheduled-task installer for the original Windows version |
