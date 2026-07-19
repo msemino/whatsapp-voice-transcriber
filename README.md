@@ -156,7 +156,7 @@ It is recorded because the wrong hypothesis was the attractive one: `@lid` had c
 
 **Not depending on `$1`.** It is a minifier-generated symbol and can be `$2` in the next build. `serialiseMsgKey()` degrades through three steps — `_serialized` → `$1` → **rebuild from the stable `fromMe`/`remote`/`id` fields** — and the rebuild produces the identical string.
 
-### The canary, and the first version that was thrown away
+### The check that runs on a schedule, and the first version that was thrown away
 
 A check now runs every few days against the media path.
 
@@ -166,10 +166,10 @@ The deployed version walks the production path: serialise the id → **look the 
 
 Two rules in its result contract:
 
-- **"No material" is not green.** With no voice note to test against, it reports that it *could not run*. A silent canary is indistinguishable from a healthy one — which is the original bug, again.
+- **"No material" is not green.** With no voice note to test against, it reports that it *could not run*. A check that quietly does nothing looks exactly like a check that passes — which is the original bug, again.
 - **It reports which door it came through** (`via`). Green via `rebuilt` means the field was renamed again and the fallback is carrying the system — worth knowing before it fails outright.
 
-It is tested in **both** directions. A canary that has never been seen red is not a tested canary.
+It is tested in **both** directions: passing, and failing. A check that has only ever been seen passing has not been tested.
 
 ### One more bug, found on the way out
 
@@ -242,7 +242,7 @@ Che, no te olvides de traer el documento para la reunión del jueves...
 | Path | What it is |
 |---|---|
 | `daemon/audio-capture.js` | WhatsApp daemon: session, multi-account capture, self-forward detection, queue writing, minifier-tolerant id serialisation and its own media download |
-| `daemon/media-selftest.js` | Active canary for the media path — serialises an id, looks the message up **by that id**, then downloads. The step that broke |
+| `daemon/media-selftest.js` | Scheduled self-test of the media path — serialises an id, looks the message up **by that id**, then downloads. The step that broke |
 | `transcriber/transcribe-fw.py` | **Current engine.** faster-whisper int8 on CPU with VAD. Prints the transcript to stdout and nothing else |
 | `transcriber/transcribir-entrantes.ps1` | **Original GPU implementation** — whisper.cpp + CUDA on Windows. Kept deliberately: it is where the project started and it is the baseline the measurements above are compared against |
 | `transcriber/setup-task.ps1` | Scheduled-task installer for the original Windows version |

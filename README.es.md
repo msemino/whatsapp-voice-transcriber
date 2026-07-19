@@ -151,7 +151,7 @@ Queda registrado porque la hipótesis equivocada era la atractiva: el `@lid` ya 
 
 **No depender de `$1`.** Es un símbolo generado por el minificador y puede ser `$2` en el próximo build. `serialiseMsgKey()` degrada en tres escalones —`_serialized` → `$1` → **reconstrucción desde los campos estables `fromMe`/`remote`/`id`**— y la reconstrucción produce el string idéntico.
 
-### El canario, y la primera versión que se tiró a la basura
+### El chequeo que corre periódicamente, y la primera versión que se tiró a la basura
 
 Ahora corre un chequeo cada pocos días contra el camino de media.
 
@@ -161,10 +161,10 @@ La versión desplegada recorre el camino de producción: serializar el id → **
 
 Dos reglas en su contrato de resultado:
 
-- **"Sin material" no es verde.** Si no hay nota de voz contra la cual probar, reporta que *no pudo correr*. Un canario mudo es indistinguible de uno sano — que es, otra vez, el bug original.
+- **"Sin material" no es verde.** Si no hay nota de voz contra la cual probar, reporta que *no pudo correr*. Un chequeo que calladito no hace nada se ve igual que uno que pasa — que es, otra vez, el bug original.
 - **Reporta por qué puerta entró** (`via`). Verde vía `rebuilt` significa que el campo se renombró de nuevo y el fallback está sosteniendo el sistema — conviene saberlo antes de que falle del todo.
 
-Está probado en **los dos** sentidos. Un canario que nunca se vio en rojo no es un canario probado.
+Está probado en **los dos** sentidos: pasando y fallando. Un chequeo que solo se vio pasar no está probado.
 
 ### Un bug más, encontrado al salir
 
@@ -198,7 +198,7 @@ if (dest && dest.isMe) { enqueue(msg, "self"); }
 | Ruta | Qué es |
 |---|---|
 | `daemon/audio-capture.js` | Daemon de WhatsApp: sesión, captura multi-cuenta, detección de self-forward, escritura en la cola, serialización de id tolerante al minificador y descarga de media propia |
-| `daemon/media-selftest.js` | Canario activo del camino de media — serializa un id, busca el mensaje **por ese id** y recién ahí descarga. El paso que se rompió |
+| `daemon/media-selftest.js` | Autochequeo periódico del camino de media — serializa un id, busca el mensaje **por ese id** y recién ahí descarga. El paso que se rompió |
 | `transcriber/transcribe-fw.py` | **Motor actual.** faster-whisper int8 en CPU con VAD. Imprime la transcripción en stdout y nada más |
 | `transcriber/transcribir-entrantes.ps1` | **Implementación original en GPU** — whisper.cpp + CUDA en Windows. Se conserva a propósito: es donde nació el proyecto y es la línea base contra la que se comparan las mediciones de arriba |
 | `transcriber/setup-task.ps1` | Instalador de la tarea programada de la versión Windows original |

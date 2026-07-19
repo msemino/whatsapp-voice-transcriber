@@ -1,5 +1,5 @@
 /**
- * media-selftest.js — active canary for the media download path
+ * media-selftest.js — scheduled self-test of the media download path
  *
  * Why this file exists
  * --------------------
@@ -8,7 +8,7 @@
  * traffic and stayed happy. Only voice notes were dead.
  *
  * The lesson is not "add more monitoring". It is that a check which exercises
- * something *similar* to the broken path is worthless. This canary walks the
+ * something *similar* to the broken path is worthless. This test walks the
  * SAME path production walks:
  *
  *   1. take the most recent voice note
@@ -16,7 +16,7 @@
  *   3. look the message up again BY THAT ID   <-- this is the step that broke
  *   4. only then download and decrypt
  *
- * Step 3 is the whole point. The first version of this canary skipped it — it
+ * Step 3 is the whole point. The first version of this test skipped it — it
  * grabbed the message model straight from the collection and downloaded the
  * media without ever serialising an id. It passed on both accounts. It would
  * also have reported green throughout the entire outage. It was rewritten
@@ -26,9 +26,9 @@
  *
  * Two rules baked into the result contract:
  *
- *   - "No material" is NOT green. If there is no voice note to test with, the
- *     canary reports that it could not run. A silent canary is indistinguishable
- *     from a healthy one, and that confusion is the original bug.
+ *   - "No material" is NOT green. If there is no voice note to test with, it
+ *     reports that it could not run. A check that quietly does nothing looks
+ *     exactly like a check that passes, and that confusion is the original bug.
  *
  *   - Report WHICH door it came through (`via`). Green via "rebuilt" means the
  *     minified field was renamed again and the fallback is carrying us — worth
@@ -38,7 +38,7 @@
 "use strict";
 
 /**
- * Run the canary against a live whatsapp-web.js Client.
+ * Run the self-test against a live whatsapp-web.js Client.
  *
  * @param {import("whatsapp-web.js").Client} client
  * @returns {Promise<object>} { ok, bytes, via, ageHours, ... } or { ok:false, reason, detail }
@@ -119,12 +119,12 @@ async function runMediaSelftest(client) {
     }
   });
 
-  // "No material" is not success — it means the canary could not sing.
+  // "No material" is not success — it means the test could not run at all.
   if (result && result.reason === "no-material") {
     return {
       ok: false,
       reason: "no-material",
-      detail: `no voice notes loaded in the store (${result.seen} messages seen); canary could not run`,
+      detail: `no voice notes loaded in the store (${result.seen} messages seen); self-test could not run`,
     };
   }
   if (!result || result.reason || !result.bytes) {
